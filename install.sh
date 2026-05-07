@@ -19,12 +19,12 @@ whiptail_prompt() {
 install_packages() {
     if command -v apt >/dev/null 2>&1; then
         apt-get update
-        apt-get install -y wget whiptail iproute2
+        apt-get install -y wget whiptail iproute2 systemd
         wget https://github.com/3proxy/3proxy/releases/download/0.9.5/3proxy-0.9.5.x86_64.deb
         dpkg -i 3proxy-0.9.5.x86_64.deb || apt-get install -f -y
     elif command -v dnf >/dev/null 2>&1; then
         dnf update -y
-        dnf install -y wget dialog iproute
+        dnf install -y wget dialog iproute systemd
         wget https://github.com/3proxy/3proxy/releases/download/0.9.5/3proxy-0.9.5.x86_64.rpm
         rpm -ivh 3proxy-0.9.5.x86_64.rpm
     else
@@ -113,10 +113,42 @@ for ip in "${IPv6_Array[@]}"; do
     fi
 done
 
-log "$Interface arayüzüne IPv6 adresleri atanıyor..."
+log "$Interface arayüzüne IPv6 adresleri atanıyor ve reboot için kalıcı hale getiriliyor..."
+
+# Başlangıçta çalışacak olan bash scripti oluştur
+PERSISTENT_SCRIPT="/usr/local/bin/proxy-ipv6-add.sh"
+echo '#!/bin/bash' > "$PERSISTENT_SCRIPT"
+chmod +x "$PERSISTENT_SCRIPT"
+
 for ip in "${IPv6_Array[@]}"; do
-    ip -6 addr add "$ip/64" dev "$Interface" || echo "⚠️ $ip atanamadı, atla"
+    # O an atama yap
+    ip -6 addr add "$ip/64" dev "$Interface" 2>/dev/null || echo "⚠️ $ip atanamadı veya zaten mevcut, atlanıyor."
+    
+    # Kalıcı olması için başlangıç scriptine yaz
+    echo "ip -6 addr add $ip/64 dev $Interface 2>/dev/null || true" >> "$PERSISTENT_SCRIPT"
 done
+
+log "Kalıcı IPv6 servisi yapılandırılıyor..."
+SERVICE_FILE="/etc/systemd/system/proxy-ipv6.service"
+cat <<EOF > "$SERVICE_FILE"
+[Unit]
+Description=Add Extra IPv6 Addresses for 3Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$PERSISTENT_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Servisleri etkinleştir ve başlat
+systemctl daemon-reload
+systemctl enable proxy-ipv6.service
+systemctl enable 3proxy
 
 log "3proxy yeniden başlatılıyor..."
 systemctl restart 3proxy
