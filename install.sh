@@ -17,6 +17,7 @@ whiptail_prompt() {
 }
 
 install_packages() {
+    log "Gerekli paketler kontrol ediliyor..."
     if command -v apt >/dev/null 2>&1; then
         apt-get update
         apt-get install -y wget whiptail iproute2 systemd
@@ -35,13 +36,13 @@ install_packages() {
 
 [[ "$(id -u)" -ne 0 ]] && { echo "❌ Script root olarak çalıştırılmalıdır."; exit 1; }
 
+# Kurulum kontrolü
 if [ ! -f /ipv6lw ]; then
-    log "İlk kurulum tespit edildi, gerekli paketler kuruluyor..."
     install_packages
     touch /ipv6lw
-    log "Kurulum tamamlandı."
 fi
 
+# Kullanıcı Seçimleri
 AuthType=$(whiptail --title "Kimlik Doğrulama Türü" --menu "Bir kimlik doğrulama yöntemi seçin:" 15 60 2 \
 "PASS" "Kullanıcı adı / şifre ile" \
 "IP" "IP Whitelist (şifresiz)" 3>&1 1>&2 2>&3)
@@ -75,18 +76,20 @@ else
     AllowIP=$(whiptail_prompt "Erişime izin verilecek IP adresini girin" "IP Whitelist")
 fi
 
-log "IPv6 adresleri oluşturuluyor..."
+# IPv6 Listesi Hazırlama
 IPv6_Array=()
 for ((i = 1; i <= ProxyCount; i++)); do
     IPv6_Array+=("$IPv6_Base::$(printf '%x' $i)")
 done
 
+# 3proxy Yapılandırması
 log "3proxy yapılandırması oluşturuluyor..."
 CONFIG_FILE="/etc/3proxy/3proxy.cfg"
 cat <<EOF > "$CONFIG_FILE"
 daemon
 nserver 1.1.1.1
-maxconn 200
+nserver 8.8.8.8
+maxconn 500
 nscache 65536
 timeouts 1 5 30 60 180 1800 15 60
 setgid 65535
@@ -106,33 +109,26 @@ fi
 Port=30000
 for ip in "${IPv6_Array[@]}"; do
     ((Port++))
-    if [[ "$ProxyType" == "SOCKS5" ]]; then
-        echo "socks -6 -n -a -p$Port -e$ip" >> "$CONFIG_FILE"
-    else
-        echo "proxy -6 -n -a -p$Port -e$ip" >> "$CONFIG_FILE"
-    fi
+    [[ "$ProxyType" == "SOCKS5" ]] && echo "socks -6 -n -a -p$Port -e$ip" >> "$CONFIG_FILE" || echo "proxy -6 -n -a -p$Port -e$ip" >> "$CONFIG_FILE"
 done
 
-log "$Interface arayüzüne IPv6 adresleri atanıyor ve reboot için kalıcı hale getiriliyor..."
+# --- KALICILIK VE OTOMASYON BÖLÜMÜ ---
 
-# Başlangıçta çalışacak olan bash scripti oluştur
+log "Kalıcılık ayarları yapılıyor..."
+
+# 1. IP Atama Scripti (Helper)
 PERSISTENT_SCRIPT="/usr/local/bin/proxy-ipv6-add.sh"
 echo '#!/bin/bash' > "$PERSISTENT_SCRIPT"
-chmod +x "$PERSISTENT_SCRIPT"
-
 for ip in "${IPv6_Array[@]}"; do
-    # O an atama yap
-    ip -6 addr add "$ip/64" dev "$Interface" 2>/dev/null || echo "⚠️ $ip atanamadı veya zaten mevcut, atlanıyor."
-    
-    # Kalıcı olması için başlangıç scriptine yaz
     echo "ip -6 addr add $ip/64 dev $Interface 2>/dev/null || true" >> "$PERSISTENT_SCRIPT"
 done
+chmod +x "$PERSISTENT_SCRIPT"
 
-log "Kalıcı IPv6 servisi yapılandırılıyor..."
+# 2. Systemd Servisi (Reboot için)
 SERVICE_FILE="/etc/systemd/system/proxy-ipv6.service"
 cat <<EOF > "$SERVICE_FILE"
 [Unit]
-Description=Add Extra IPv6 Addresses for 3Proxy
+Description=IPv6 Proxy Address Persistence
 After=network-online.target
 Wants=network-online.target
 
@@ -145,24 +141,33 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
-# Servisleri etkinleştir ve başlat
+# 3. NetworkManager Tetikleyicisi (Uzak Masaüstü / Bağlantı Kopması için)
+DISPATCHER_DIR="/etc/NetworkManager/dispatcher.d"
+if [ -d "$DISPATCHER_DIR" ]; then
+    log "NetworkManager tetikleyicisi ekleniyor..."
+    cat <<EOF > "$DISPATCHER_DIR/99-proxy-ipv6"
+#!/bin/bash
+if [ "\$2" = "up" ]; then
+    /usr/bin/systemctl restart proxy-ipv6.service
+    /usr/bin/systemctl restart 3proxy
+fi
+EOF
+    chmod +x "$DISPATCHER_DIR/99-proxy-ipv6"
+fi
+
+# Servisleri Aktifleştir
 systemctl daemon-reload
 systemctl enable proxy-ipv6.service
 systemctl enable 3proxy
+$PERSISTENT_SCRIPT # IP'leri hemen şimdi ata
 
-log "3proxy yeniden başlatılıyor..."
+log "3proxy başlatılıyor..."
 systemctl restart 3proxy
 
+log "İşlem Tamam! Reboot atsanız da, Uzak Masaüstü ile bağlansanız da proxyleriniz kalıcıdır."
 log "Proxy Listesi:"
-[[ "$AuthType" == "PASS" ]] && {
-    echo "Kullanıcı Adı: $UserName"
-    echo "Şifre: $Password"
-} || {
-    echo "İzinli IP: $AllowIP"
-}
-
 Port=30000
 for ip in "${IPv6_Array[@]}"; do
     ((Port++))
-    echo "TCP/$Port    IPv6: $ip"
+    echo "Port: $Port -> IPv6: $ip"
 done
